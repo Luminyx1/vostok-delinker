@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 capstone = "0.14.0"
-object = "0.38.1"
+object = { version = "0.31.1", features = ["pe", "write_core"] }
+pdb2 = "0.10.1"

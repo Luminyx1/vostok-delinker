@@ -1,21 +1,114 @@
+#![expect(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
+use std::borrow::Cow;
 use std::collections::HashMap;
 
-use capstone::Capstone;
-use capstone::arch::ArchOperand;
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::arch::ArchOperand;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
+use capstone::Capstone;
 
 use object::write::StandardSegment;
 use object::{Object, ObjectSection, SectionKind};
-use pdb2::FallibleIterator;
+use pdb2::{FallibleIterator, RawString};
 
 const EXECUTABLE: &[u8] = include_bytes!("../resources/survarium.exe");
 const DEBUG_SYMBOLS: &[u8] = include_bytes!("../resources/survarium.pdb");
+
+// pub struct Objdiff
+
+#[derive(Clone, Default, Debug)]
+pub struct Executable<'a> {
+    // `HashMap` was chosen, because we need to make lookups
+    // based on what function calls or jumps to.
+    //
+    // `Vec` is always `NonEmpty`.
+    pub functions: std::collections::HashMap<usize, Vec<Function<'a>>>,
+    // constants?
+    // statics?
+}
+
+#[derive(Clone, Debug)]
+pub struct Function<'a> {
+    pub name: RawString<'a>,
+    pub mangled_name: Option<RawString<'a>>,
+    pub filename: Option<RawString<'a>>,
+
+    pub address: usize,
+
+    pub data: &'a [u8],
+}
+
+// # Notes
+//
+// ## On object file structure
+// Since there were no proper object files, because of LTO, we will be basing everything on our own structure.
+//
+// There are multiple ways to separate them:
+// 1. Based on file structure.
+//  +. Gets as close to matching code based on original object files as possible.
+//  +. We have PDB files containing that information.
+//  -. Compiler generated methods usually do not have source file specified.
+//
+// 2. Based on class hierarchy:
+//  +. Easy to navigate and search for.
+//  -. Harder to figure out the structure for free functions, which might also be static and which
+//      might not even have namespaces.
+//  -. Requires parsing mangled symbols.
+//
+// I prefer the first option with the second one being used for compiler generated symbols.
+//
+// ## Current problems
+// 1. Mangled symbols are taken incorrectly, since we have no way to properly disambiguate them.
+//  =. We can try to find in mangled symbols function name. Might solve the problem somewhat.
+//  =. Are mangled symbols even needed?
+//
+// 2. Jump symbols suffer the same problem.
+//  =. The solution is to not be exactly correct, but be exact when comparing `base` and `target`.
+//  =. I like optimization of taking the smallest symbol available for `target`.
+//  =. Or by first searching whether there is a symbol with the same class name.
+//  =. Base should just default to what target picked, and use those "optimizations", if nothing was matching.
+//
+// 3. `object` crate always prepends '_' to all symbols. Which is incorrect for C++ mangling scheme.
+//  =. Fork or just ignore the problem.
+//
+// 4. What should be done about functions with the same assembly but with different symbols?
+//  =. They should all be their own separate functions.
+//
+// 5. What should be even parsed?
+//  =. We need metrics for specific `vostok` and `survarium` modules for server code.
+//  =. We most likely DON'T need anything in boost or Scaleform. All of that just takes precious time.
+//  =. We might still want `bullet` functions, since devs were updating its source code manually.
 
 fn main() {
     let exe = object::File::parse(EXECUTABLE).unwrap();
     let pdb = pdb2::PDB::open(std::io::Cursor::new(DEBUG_SYMBOLS)).unwrap();
 
+    // play_with_demangler();
+    process_executable(exe, pdb).unwrap();
+    // build_dummy_object_file();
+}
+
+fn play_with_demangler() {
+    let mangled_names = [
+        "??0box_geometry_instance@collision@vostok@@QAE@ABVfloat4x4@math@2@@Z",
+        "??1box_geometry_instance@collision@vostok@@UAE@XZ",
+        "??_Gbox_geometry_instance@collision@vostok@@UAEPAXI@Z",
+        "?aabb_test@box_geometry_instance@collision@vostok@@UBE_NABVaabb@math@3@@Z",
+    ];
+    for mangled_name in mangled_names {
+        let name =
+            msvc_demangler::demangle(mangled_name, msvc_demangler::DemangleFlags::empty()).unwrap();
+        println!("{name}");
+
+        let data = msvc_demangler::parse(mangled_name).unwrap();
+        println!("{data:#?}\n");
+    }
+}
+
+fn build_dummy_object_file() {
     let mut object = object::write::Object::new(
         object::BinaryFormat::Coff,
         object::Architecture::I386,
@@ -163,218 +256,335 @@ fn main() {
 
     let object_data = object.write().unwrap();
     std::fs::write("./objdiff/base/data.obj", object_data).unwrap();
-
-    // process_executable(exe, pdb);
 }
 
 fn process_executable<S: pdb2::Source<'static> + 'static>(
-    exe: object::File,
+    exe: object::File<'static>,
     pdb: pdb2::PDB<'static, S>,
-) {
-    let functions = extract_function(exe, pdb).unwrap();
-
-    let capstone = Capstone::new()
+) -> anyhow::Result<()> {
+    let ctx = Capstone::new()
         .x86()
         .mode(ArchMode::Mode32)
         .syntax(ArchSyntax::Intel)
         .detail(true)
         .build()
         .expect("Cannot create Capstone context");
-    print_instructions(functions, &capstone);
+
+    let exe: &'static object::File = leak(exe);
+
+    Executable::parse(exe, pdb)?.print_instructions(&ctx)?;
+
+    Ok(())
 }
 
-fn print_instructions(exe: Executable, ctx: &Capstone) {
-    use capstone::InsnGroupType::*;
-    use capstone::arch::x86::X86InsnGroup::*;
+impl<'a: 'static> Executable<'a> {
+    fn parse<S: pdb2::Source<'static> + 'static>(
+        exe: &'static object::File,
+        mut pdb: pdb2::PDB<'static, S>,
+    ) -> anyhow::Result<Self> {
+        let mut this = Self::default();
 
-    const KNOWN_FUNCTIONS: &[&str] = &[
-        // "vostok::render::static_render_model_instance::static_render_model_instance",
-        // "btCollisionWorld::RayResultCallback::getShapeId",
-        // "vostok::collision::object::object",
-        // "vostok::network_core::buffer_to_send",
-        // "vostok::animation::bone_names::create_internals_in_place",
-    ];
+        let Some(text_sec) = exe.section_by_name(".text") else {
+            return Ok(this);
+        };
 
-    let iter = exe
-        .functions
-        .values()
-        .filter(|funs| {
-            funs.iter()
-                .any(|fun| KNOWN_FUNCTIONS.contains(&fun.name.as_str()))
-        })
-        .map(|funs| &funs[0]);
-    // .take(10);
+        let text_section_address = text_sec.address() as usize;
+        let text_data = text_sec.data()?;
 
-    for fun in iter {
-        let disassembleds = ctx
-            .disasm_all(&fun.data, fun.address as u64)
-            .expect("oopsie");
+        //
+        //
+        //
 
-        // println!(
-        //     "\n{} {:#010x} {:#010x} ",
-        //     fun.name,
-        //     fun.address,
-        //     fun.address + fun.data.len()
-        // );
-        for ix in disassembleds.as_ref() {
-            let detail = ctx.insn_detail(ix).unwrap();
-            let groups = detail.groups().iter().map(|v| u32::from(v.0));
-            let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
+        let symbol_table: &'static pdb2::SymbolTable<'static> = leak(pdb.global_symbols()?);
+        let mangled_table = {
+            let mut symbols = symbol_table.iter();
+            let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
 
-            let mut fn_name = None;
-            if is_branch {
-                let arch_detail = detail.arch_detail();
-                let ops = arch_detail.operands();
-                assert_eq!(ops.len(), 1);
-
-                let ArchOperand::X86Operand(X86Operand {
-                    op_type: X86OperandType::Imm(target_address),
-                    ..
-                }) = ops[0]
-                else {
-                    unreachable!()
-                };
-
-                let target_address = usize::try_from(target_address).unwrap();
-
-                let internal_branch =
-                    (fun.address..fun.address + fun.data.len()).contains(&target_address);
-                if !internal_branch {
-                    let target_fun = exe.functions.get(&target_address);
-
-                    if let Some(target_fun) = target_fun {
-                        fn_name = Some(target_fun[0].name.clone());
-                    } else {
-                        // This happens in multiple cases:
-                        // * the decompiled assembly is actually not a code, but data (most often jump tables for switches)
-                        // * the target points to compiler generated(?) function, which doesn't seem to be in debug files.
-                        //  For example, vostok::network_core::http_client::handle_read_content
-                        //
-                        // This is fine, since this is rare, and we do not care for exact - 100% match of the assembly in all cases.
-                    };
+            while let Some(symbol) = symbols.next()? {
+                match symbol.parse() {
+                    Ok(pdb2::SymbolData::Public(data)) if data.function => {
+                        let offset = data.offset.offset as usize;
+                        mangled_table.entry(offset).or_default().push(data.name);
+                    }
+                    _ => {}
                 }
             }
+            mangled_table
+        };
 
-            println!(
-                "  {:#010x}: {} {}{}",
-                ix.address(),
-                ix.mnemonic().unwrap_or(""),
-                ix.op_str().unwrap_or(""),
-                match fn_name {
-                    None => format!(""),
-                    Some(fn_name) => format!(" | CALLING {fn_name}"),
-                },
-            )
-        }
-    }
-}
+        //
+        //
+        //
 
-#[derive(Clone, Default, Debug)]
-pub struct Executable {
-    pub functions: std::collections::HashMap<usize, Vec<Function>>,
-}
+        let dbi = leak(pdb.debug_information()?);
+        let string_table: &'static pdb2::StringTable<'static> = leak(pdb.string_table()?);
 
-#[derive(Clone, Debug)]
-pub struct Function {
-    pub name: String,
-    pub mangled_name: Option<String>,
-    pub address: usize,
-    pub data: Vec<u8>,
-}
+        let mut modules = dbi.modules()?;
 
-fn extract_function<S: pdb2::Source<'static> + 'static>(
-    exe: object::File,
-    mut pdb: pdb2::PDB<'static, S>,
-) -> Result<Executable, Box<dyn std::error::Error>> {
-    let mut res = Executable::default();
+        while let Some(module) = modules.next()? {
+            let Some(module_info) = pdb.module_info(&module)? else {
+                continue;
+            };
+            let module_info = leak(module_info);
 
-    let Some(text_sec) = exe.section_by_name(".text") else {
-        return Ok(res);
-    };
-
-    //
-    //
-    //
-
-    let mangled_table = {
-        let mut mangled_table = HashMap::<usize, Vec<String>>::new();
-
-        let symbol_table = pdb.global_symbols()?;
-        let mut symbols = symbol_table.iter();
-        while let Some(symbol) = symbols.next()? {
-            match symbol.parse() {
-                Ok(pdb2::SymbolData::Public(data)) if data.function => {
-                    let offset = data.offset.offset as usize;
-                    mangled_table
-                        .entry(offset)
-                        .or_default()
-                        .push(data.name.to_string().to_string());
-                }
-                _ => {}
-            }
-        }
-        mangled_table
-    };
-
-    //
-    //
-    //
-
-    let text_section_address = text_sec.address() as usize;
-    let text_data = text_sec.data()?;
-
-    let dbi = pdb.debug_information()?;
-    let mut modules = dbi.modules()?;
-
-    while let Some(module) = modules.next()? {
-        if let Some(module_info) = pdb.module_info(&module)? {
+            let program = module_info.line_program()?;
             let mut iter = module_info.symbols()?;
 
-            let mut add_function_from_pdb =
-                |name: pdb2::RawString, offset: pdb2::PdbInternalSectionOffset, len: u32| {
-                    let name = name.to_string().to_string();
-                    let offset = offset.offset as usize;
-                    let len = len as usize;
-
-                    if len == 0 {
-                        todo!()
-                    }
-
-                    let mangled_name = match mangled_table.get(&offset) {
-                        Some(symbols) => Some(symbols[0].to_string()),
-                        None => None,
-                    };
-                    let address = text_section_address + offset;
-                    let data = text_data[offset..offset + len].to_vec();
-
-                    res.functions.entry(address).or_default().push(Function {
-                        name,
-                        mangled_name,
-                        address,
-                        data,
-                    })
-                };
-
             while let Some(symbol) = iter.next()? {
-                match symbol.parse() {
+                let (name, offset, len) = match symbol.parse() {
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
                         name,
                         offset,
                         len,
                         ..
-                    })) => {
-                        add_function_from_pdb(name, offset, len);
-                    }
+                    })) => (name, offset, len),
                     Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
                         offset, len, name, ..
-                    })) => {
-                        add_function_from_pdb(name, offset, len.into());
-                    }
-                    _ => (),
-                }
+                    })) => (name, offset, len.into()),
+                    _ => continue,
+                };
+
+                let function = Function::extract(
+                    text_section_address,
+                    text_data,
+                    &program,
+                    string_table,
+                    &mangled_table,
+                    name,
+                    offset,
+                    len,
+                )?;
+
+                this.functions
+                    .entry(function.address)
+                    .or_default()
+                    .push(function);
             }
         }
+
+        Ok(this)
     }
 
-    Ok(res)
+    fn print_instructions(self, ctx: &Capstone) -> anyhow::Result<()> {
+        use capstone::arch::x86::X86InsnGroup::*;
+        use capstone::InsnGroupType::*;
+
+        const KNOWN_FUNCTIONS: &[&str] = &[
+        // "vostok::render::static_render_model_instance::static_render_model_instance",
+        // "btCollisionWorld::RayResultCallback::getShapeId",
+        // "vostok::collision::object::object",
+        // "vostok::network_core::buffer_to_send",
+        // "vostok::animation::bone_names::create_internals_in_place",
+        // "vostok::collision::box_geometry_instance",
+        // "vostok::",
+        // "survarium::",
+        ];
+
+        const SKIP_FUNCTIONS: &[&str] = &[
+            "boost::",
+            "Scaleform::",
+            "stlp_std::",
+            //
+            "survarium::",
+            "vostok::",
+            // "survarium::",
+        ];
+
+        // # Static function in namespace
+        //
+        // vostok::render::get_world_to_decal_matrix
+        // <NO MANGLED NAME>
+        // c:\survarium\sources\vostok\render\engine\sources\decal_instance.cpp
+        //
+        //
+        // # Static function without namespace
+        //
+        // free_region_impl
+        // <NO MANGLED NAME>
+        // c:\survarium\sources\vostok\core\sources\memory_win.cpp
+        //
+        //
+        // # Compiler generate function in namespace
+        //
+        // vostok::animation::`dynamic atexit destructor for 's_bi_spline_skeleton_animation_impl_cook''
+        // <NO MANGLED NAME>
+        // c:\survarium\sources\vostok\animation\sources\bi_spline_skeleton_animation_impl_cook.cpp
+
+        let iter = self
+            .functions
+            .values()
+            .flat_map(|funs| funs.iter()) // NOTE
+            .filter(|fun| {
+                let in_source_code = matches!(
+                    &fun.filename,
+                    Some(filename) if filename.as_bytes().starts_with(b"c:\\survarium\\sources\\vostok"),
+                );
+                if in_source_code {
+                    return true;
+                }
+
+                let fun_name = fun.name.as_bytes();
+                let in_known_modules = fun_name.starts_with(b"survarium::")
+                    || fun_name.starts_with(b"vostok::")
+                    || fun_name.starts_with(b"`survarium::")
+                    || fun_name.starts_with(b"`vostok::");
+
+                in_known_modules
+            });
+        // .map(|funs| &funs[0]); // @NOTE
+
+        for fun in iter {
+            if fun.filename.is_some() {
+                continue; // NOTE
+            }
+
+            let disassembleds = ctx.disasm_all(&fun.data, fun.address as u64)?;
+
+            let fun_name = fun.name.to_string();
+
+            let fun_mangled_name = fun.mangled_name.map(|name| name.to_string());
+            let fun_mangled_name = fun_mangled_name.as_deref().unwrap_or("<NO MANGLED NAME>");
+
+            let fun_filename = fun.filename.map(|name| name.to_string());
+            let fun_filename = fun_filename.as_deref().unwrap_or("<NO FILNAME>");
+
+            println!(
+                "\n{fun_name}\n{fun_mangled_name}\n{fun_filename}\n{:#010x} {:#010x} ",
+                fun.address,
+                fun.address + fun.data.len()
+            );
+
+            for ix in disassembleds.as_ref() {
+                let detail = ctx.insn_detail(ix)?;
+                let groups = detail.groups().iter().map(|v| u32::from(v.0));
+                let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
+
+                let mut fn_name = None;
+                if is_branch {
+                    let arch_detail = detail.arch_detail();
+                    let ops = arch_detail.operands();
+                    assert_eq!(ops.len(), 1);
+
+                    let ArchOperand::X86Operand(X86Operand {
+                        op_type: X86OperandType::Imm(target_address),
+                        ..
+                    }) = ops[0]
+                    else {
+                        unreachable!()
+                    };
+
+                    let target_address = usize::try_from(target_address)?;
+
+                    let internal_branch =
+                        (fun.address..fun.address + fun.data.len()).contains(&target_address);
+                    if !internal_branch {
+                        let target_fun = self.functions.get(&target_address);
+
+                        if let Some(target_fun) = target_fun {
+                            fn_name = Some(target_fun[0].name.clone());
+                        } else {
+                            // This happens in multiple cases:
+                            // * the decompiled assembly is actually not a code, but data (most often jump tables for switches)
+                            // * the target points to compiler generated(?) function, which doesn't seem to be in debug files.
+                            //  For example, vostok::network_core::http_client::handle_read_content
+                            //
+                            // This is fine, since this is rare, and we do not care for exact - 100% match of the assembly in all cases.
+                        };
+                    }
+                }
+
+                // println!(
+                //     "  {:#010x}: {} {}{}",
+                //     ix.address(),
+                //     ix.mnemonic().unwrap_or(""),
+                //     ix.op_str().unwrap_or(""),
+                //     match fn_name {
+                //         None => format!(""),
+                //         Some(fn_name) => format!(" | CALLING {fn_name}"),
+                //     },
+                // )
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Function<'static> {
+    fn extract(
+        text_section_address: usize,
+        text_data: &'static [u8],
+
+        program: &pdb2::LineProgram,
+        string_table: &'static pdb2::StringTable<'static>,
+        mangled_table: &std::collections::HashMap<usize, Vec<RawString<'static>>>,
+
+        name: pdb2::RawString<'static>,
+        offset: pdb2::PdbInternalSectionOffset,
+        len: u32,
+    ) -> anyhow::Result<Self> {
+        let mut filename = None;
+
+        let mut lines = program.lines_for_symbol(offset);
+        while let Some(line_info) = lines.next()? {
+            let file_info = program.get_file_info(line_info.file_index)?;
+            filename = Some(string_table.get(file_info.name)?);
+            // filename = Some(file_info.name.to_raw_string(&string_table)?);
+            break;
+        }
+
+        let offset = offset.offset as usize;
+        let len = len as usize;
+        if len == 0 {
+            anyhow::bail!("Functions cannot be unsized")
+        }
+
+        let mangled_name: Option<RawString> = match mangled_table.get(&offset) {
+            Some(symbols) if symbols.len() == 1 => Some(symbols[0]),
+            Some(symbols) => Some(find_closest_symbol(name, &symbols)),
+            None => None,
+        };
+
+        Ok(Function {
+            name,
+            mangled_name: mangled_name,
+            filename: filename,
+            address: text_section_address + offset,
+            data: &text_data[offset..offset + len],
+        })
+    }
+}
+
+// rfind + contains works for `&str`
+// windows + rposition works for `&[u8]`
+fn find_closest_symbol<'a, 'p>(name: RawString, symbols: &'a [RawString<'p>]) -> RawString<'p> {
+    let pure_name = {
+        let idx = name
+            .as_bytes()
+            .windows(2)
+            .rposition(|w| w == b"::")
+            .map(|i| i + 2)
+            .unwrap_or(0);
+        &name.as_bytes()[idx..]
+    };
+    let closest_symbol = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol
+                .as_bytes()
+                .windows(pure_name.len())
+                .any(|w| w == pure_name)
+        })
+        .min_by_key(|symbol| symbol.len());
+    if let Some(closest_symbol) = closest_symbol {
+        return *closest_symbol;
+    }
+    *symbols
+        .iter()
+        .min_by_key(|symbol| symbol.len())
+        .expect("Symbols might contain at least a single element")
+}
+
+// Most of those leaks have to exist to "leak" Streams which for some reason are owning in pdb crate.
+fn leak<T>(object: T) -> &'static T {
+    Box::leak(Box::new(object))
 }

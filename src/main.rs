@@ -26,7 +26,6 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub output_path: std::path::PathBuf,
 
-    // "c:\\survarium\\sources\\" for target
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub engine_path: String,
 }
@@ -58,14 +57,6 @@ pub struct SecInfo<'a> {
 // ## 4. sushi@TODO: Start discussion in object crate
 // ## 6. sushi@TODO: Relocations in .data and .rdata
 // ## 7. sushi@TODO: Initialized statics in .rdata
-//
-//
-// ## 9. sushi@TODO: CMD tool.
-//
-// 1. Command line arguments need to be added (with clap).
-// 2. We need to distinguish `target` and `base` executables. `base` executables should try to
-//    use the same symbols `target` is using (when possible during disambiguation) for closer
-//    assembly matches.
 
 fn main() -> anyhow::Result<()> {
     let Cli {

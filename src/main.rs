@@ -237,23 +237,43 @@ impl ObjectFiles<'static> {
                 let mut iter = module_info.symbols()?;
 
                 while let Some(symbol) = iter.next()? {
-                    let (name, offset) = match symbol.parse() {
+                    let (size, name, offset) = match symbol.parse() {
                         Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
+                            len,
                             name,
                             offset,
                             ..
-                        })) => (name, offset),
-                        Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { offset, name, .. })) => {
-                            (name, offset)
-                        }
+                        })) => (len, name, offset),
+                        Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
+                            len,
+                            offset,
+                            name,
+                            ..
+                        })) => (len as u32, name, offset),
                         _ => continue,
                     };
 
-                    match functions.entry(offset.offset as usize) {
+                    let fun_offset_in_text = offset.offset as usize;
+                    let fun_body =
+                        &text.data[fun_offset_in_text..fun_offset_in_text + size as usize];
+
+                    let fun_rename: Option<RawString> = match fun_body {
+                        [0xc3] => Some(b"empty_stub".as_slice().into()),
+                        [0x8b, 0x44, 0x24, 0x04, 0xc3] => Some(b"identity".as_slice().into()),
+                        [0x8b, 0x0, 0xc3] => Some(b"vec_begin".as_slice().into()),
+                        [0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3,] => Some(b"vec_size".as_slice().into()),
+                        _ => None,
+                    };
+                    match functions.entry(fun_offset_in_text) {
                         btree_map::Entry::Vacant(entry) => {
-                            entry.insert(vec![name]);
+                            entry.insert(vec![fun_rename.unwrap_or(name)]);
                         }
-                        _ => (),
+                        btree_map::Entry::Occupied(mut entry) => match fun_rename {
+                            Some(fun_rename) => {
+                                *entry.get_mut() = vec![fun_rename];
+                            }
+                            None => (),
+                        },
                     }
                 }
             }
@@ -352,7 +372,7 @@ impl ObjectFiles<'static> {
                         () if (text.va..text.va + text.size).contains(&target_va) => {
                             let target_offset_in_text = target_va - text.va;
 
-                            let (function_offset_in_text, function_names) = functions
+                            let (function_offset_in_text, function_overloads) = functions
                                 .range(..=target_offset_in_text)
                                 .next_back()
                                 .expect("all function relocs to be named");
@@ -365,7 +385,7 @@ impl ObjectFiles<'static> {
                             text_relocs.insert(
                                 offset_in_text,
                                 RelocKind::Function {
-                                    overloads: function_names,
+                                    overloads: function_overloads,
                                 },
                             );
                         }
@@ -833,7 +853,15 @@ impl ObjectFiles<'static> {
         for (prefix, object_file) in self.objects {
             path.as_mut_os_string().truncate(base_len);
 
-            path.push(std::str::from_utf8(prefix)?);
+            let prefix = prefix
+                .iter()
+                .map(|&c| match c {
+                    b'\\' => '/',
+                    _ => c as char,
+                })
+                .collect::<String>();
+            path.as_mut_os_string().push("/");
+            path.as_mut_os_string().push(&prefix);
             path.as_mut_os_string().push(".obj");
 
             std::fs::create_dir_all(path.parent().unwrap())?;

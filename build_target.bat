@@ -1,3 +1,5 @@
+@echo off
+
 if not defined ROOT_DIR       set "ROOT_DIR=%~dp0\.."
 for %%I in ("%ROOT_DIR%")  do set "ROOT_DIR=%%~fI"
 

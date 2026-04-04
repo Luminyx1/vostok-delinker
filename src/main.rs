@@ -9,9 +9,8 @@ use capstone::Capstone;
 use capstone::InsnGroupType::*;
 
 use clap::Parser;
-use object::read::pe::PeSection;
-use object::LittleEndian;
-use object::{Object, ObjectSection, SectionKind};
+use object::{LittleEndian, SectionKind};
+use object::{Object, ObjectSection};
 
 use pdb2::{FallibleIterator, RawString};
 
@@ -111,7 +110,7 @@ impl ObjectFiles<'static> {
         let dbi = leak(pdb.debug_information()?);
         let string_table: &'static pdb2::StringTable<'static> = leak(pdb.string_table()?);
 
-        let build_sec_info = |sec: PeSection<'static, 'static, _>| {
+        let build_sec_info = |sec: object::read::pe::PeSection<'static, 'static, _>| {
             Ok::<_, anyhow::Error>(SecInfo {
                 rva: sec.address() as usize - image_base as usize,
                 va: sec.address() as usize,
@@ -619,6 +618,15 @@ impl ObjectFiles<'static> {
                         let text_section_id =
                             object.add_section(vec![], b".text".into(), SectionKind::Text);
 
+                        // objdiff considers allocations to match if name is equal OR(!) offset
+                        // into reloc table is the same.
+                        //
+                        // This makes different relocations with different data and different names
+                        // to match, if they offsets match. These 4 bytes prevent that.
+                        if engine_path == b"c:\\survarium\\sources\\" {
+                            object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
+                        }
+
                         ObjectFile {
                             object,
                             data_section_id,
@@ -703,7 +711,7 @@ impl ObjectFiles<'static> {
                             RelocKind::ConstantValue { data } => {
                                 // sushi@TODO: data might be reloc as well, so needs to be handled properly
                                 let reloc_name =
-                                    format!("value_0x{:x?}", u32::from_le_bytes(*data));
+                                    format!("?value_0x{:x?}@@3IA", u32::from_le_bytes(*data));
 
                                 let const_offset_in_coff =
                                     append_with_padding(object, *rdata_section_id, data, 0x00);

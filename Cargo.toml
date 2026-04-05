@@ -17,7 +17,8 @@ object = {
   features = ["pe", "write_core"],
 }
 
-[workspace.lints.clippy]
+[lints.clippy]
 collapsible_if = "allow"
 manual_is_multiple_of = "allow"
 new_without_default = "allow"
+single_match = "allow"

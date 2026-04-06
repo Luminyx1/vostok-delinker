@@ -377,7 +377,7 @@ impl ObjectFiles<'static> {
                     }
 
                     // .reloc        .text/.rdata/.data  .text/.rdata/.data
-                    // [reloc_va]    [target_va]         [target]
+                    // [reloc_rva]   [target_va]         [target]
                     //   |              ^    |              ^
                     //   |              |    |              |
                     //   +--------------+    +--------------+
@@ -780,7 +780,6 @@ impl ObjectFile {
 
                 match maybe_rva.and_then(|rva| relocs_rva.get(&rva)) {
                     Some(chained_reloc_kind) => {
-                        println!("{fun_name} | {reloc_name}");
                         self.add_relocation_at(
                             *chained_reloc_kind,
                             const_offset_in_coff_rdata,

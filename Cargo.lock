@@ -77,6 +77,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "bytemuck"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "capstone"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -276,7 +296,8 @@ dependencies = [
 [[package]]
 name = "object"
 version = "0.39.0"
-source = "git+https://github.com/srp-survarium/object?rev=76af56e7c23fffa02bb9c561e6bbb7e137e7d974#76af56e7c23fffa02bb9c561e6bbb7e137e7d974"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63944c133d03f44e75866bbd160b95af0ec3f6a13d936d69d31c81078cbc5baf"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -416,6 +437,7 @@ name = "vostok-delinker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "capstone",
  "clap",
  "msvc-demangler",

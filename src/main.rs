@@ -76,7 +76,8 @@ pub enum RelocKind<'a> {
         data: &'a [u8],
     },
     ConstantValue {
-        target_rva: usize,
+        target_data: u32,
+        maybe_rva: Option<usize>,
     },
 
     // .data
@@ -323,7 +324,8 @@ impl ObjectFiles<'static> {
         // @NOTE: They can be in other parts
         //
 
-        let mut exe_data = map_pe_image(&exe);
+        let exe_data = map_pe_image(&exe); // Either clone data or iterate twice
+        let mut coff_data = exe_data.clone();
         let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
 
         let Some(reloc_sec) = exe.section_by_name(".reloc") else {
@@ -388,7 +390,7 @@ impl ObjectFiles<'static> {
                         bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
                     let target_rva = (target_va - image_base).to_usize();
 
-                    let target_va_mut = &mut exe_data[reloc_rva..reloc_rva + 4];
+                    let target_va_mut = &mut coff_data[reloc_rva..reloc_rva + 4];
 
                     match () {
                         () if (text.rva..text.rva + text.size).contains(&target_rva) => {
@@ -433,10 +435,22 @@ impl ObjectFiles<'static> {
                                 }
 
                                 Some(_) | None => {
+                                    let target_data = bytemuck::pod_read_unaligned::<u32>(
+                                        &exe_data[target_rva..target_rva + 4],
+                                    );
+                                    let maybe_rva = target_data
+                                        .checked_sub(image_base)
+                                        .map(|rva| rva.to_usize());
                                     // @TODO
                                     target_va_mut.copy_from_slice(&0_u32.to_le_bytes());
-                                    relocs_rva
-                                        .insert(reloc_rva, RelocKind::ConstantValue { target_rva });
+
+                                    relocs_rva.insert(
+                                        reloc_rva,
+                                        RelocKind::ConstantValue {
+                                            target_data,
+                                            maybe_rva,
+                                        },
+                                    );
                                 }
                             };
                         }
@@ -565,10 +579,10 @@ impl ObjectFiles<'static> {
                     let fun_va = text.va + fun_offset_in_text;
                     let fun_range_rva = fun_rva..fun_rva + fun_size;
 
-                    let mut fun_bytes = exe_data[fun_range_rva.clone()].to_vec();
+                    let mut fun_bytes = coff_data[fun_range_rva.clone()].to_vec();
                     let mut offset_in_fun = 0;
 
-                    let ixs = ctx.disasm_all(&exe_data[fun_range_rva.clone()], fun_va.to_u64())?;
+                    let ixs = ctx.disasm_all(&coff_data[fun_range_rva.clone()], fun_va.to_u64())?;
                     for ix in ixs.iter() {
                         let detail = ctx.insn_detail(ix)?;
                         let arch_detail = detail.arch_detail();
@@ -686,7 +700,7 @@ impl ObjectFiles<'static> {
                             reloc_kind,
                             reloc_offset_in_coff_text,
                             fun_name,
-                            &exe_data,
+                            &relocs_rva,
                         )?;
                     }
                 }
@@ -728,19 +742,17 @@ impl ObjectFile {
         reloc_offset: ObjectOffset,
         //
         fun_name: RawString,
-        exe_data: &[u8],
+        relocs_rva: &BTreeMap<usize, RelocKind>,
     ) -> anyhow::Result<()> {
-        match reloc_kind {
-            RelocKind::Function { overloads } => {
-                let reloc_name = find_closest_relative_call(&fun_name, overloads);
+        let reloc_name = reloc_kind.get_name(fun_name, relocs_rva);
+        let reloc_name = reloc_name.as_raw_string();
 
+        match reloc_kind {
+            RelocKind::Function { overloads: _ } => {
                 self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
             }
 
-            RelocKind::ConstantString { symbol, data } => {
-                let reloc_name = get_constant_name(symbol, data);
-                let reloc_name = RawString::from(reloc_name.as_slice());
-
+            RelocKind::ConstantString { symbol: _, data } => {
                 let const_offset_in_coff_rdata =
                     self.append_section_data(self.rdata_section_id, data, 0x00);
 
@@ -751,27 +763,36 @@ impl ObjectFile {
                 )?;
             }
 
-            RelocKind::ConstantValue { target_rva } => {
-                // sushi@TODO: data might be reloc as well, so needs to be handled properly
-                let target_data =
-                    bytemuck::pod_read_unaligned::<u32>(&exe_data[target_rva..target_rva + 4]);
-                let reloc_name = format!("?value_0x{:x?}@@3IA", target_data);
-                let reloc_name = RawString::from(reloc_name.as_bytes());
-
+            RelocKind::ConstantValue {
+                target_data,
+                maybe_rva,
+            } => {
                 let const_offset_in_coff_rdata = self.append_section_data(
                     self.rdata_section_id,
                     &target_data.to_le_bytes(),
                     0x00,
                 );
-
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                 )?;
+
+                match maybe_rva.and_then(|rva| relocs_rva.get(&rva)) {
+                    Some(chained_reloc_kind) => {
+                        println!("{fun_name} | {reloc_name}");
+                        self.add_relocation_at(
+                            *chained_reloc_kind,
+                            const_offset_in_coff_rdata,
+                            fun_name,
+                            relocs_rva,
+                        )?;
+                    }
+                    None => (),
+                }
             }
 
-            RelocKind::Static { symbol: reloc_name } => {
+            RelocKind::Static { symbol: _ } => {
                 self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
             }
         }
@@ -863,6 +884,65 @@ impl ObjectFile {
     }
 }
 
+enum Name<'a> {
+    Borrowed(RawString<'a>),
+    Owned(Vec<u8>),
+}
+
+impl<'a> RelocKind<'a> {
+    fn get_name(
+        self,
+
+        fun_name: RawString<'a>,
+        relocs_rva: &BTreeMap<usize, RelocKind<'a>>,
+    ) -> Name<'a> {
+        match self {
+            Self::Function { overloads } => {
+                Name::Borrowed(find_closest_relative_call(fun_name, overloads))
+            }
+            Self::ConstantString { symbol, data } => {
+                let reloc_name = get_constant_name(symbol, data);
+                Name::Owned(reloc_name)
+            }
+            Self::ConstantValue {
+                target_data,
+                maybe_rva,
+            } => match maybe_rva.and_then(|rva| relocs_rva.get(&rva)) {
+                None => {
+                    let reloc_name = format!("value_0x{:x?}", target_data);
+                    Name::Owned(reloc_name.into_bytes())
+                }
+
+                Some(chained_reloc_kind) => {
+                    let mut chained_reloc_name = chained_reloc_kind.get_name(fun_name, relocs_rva);
+                    chained_reloc_name.prepend(b"ptr_");
+                    chained_reloc_name
+                }
+            },
+            Self::Static { symbol: reloc_name } => Name::Borrowed(reloc_name),
+        }
+    }
+}
+
+impl Name<'_> {
+    fn prepend(&mut self, prefix: &[u8]) {
+        match self {
+            Self::Owned(name) => _ = name.splice(0..0, prefix.iter().copied()),
+            Self::Borrowed(name) => {
+                *self = Self::Owned(name.as_bytes().to_vec());
+                self.prepend(prefix);
+            }
+        }
+    }
+
+    fn as_raw_string(&self) -> RawString<'_> {
+        match self {
+            Self::Owned(name) => RawString::from(name.as_slice()),
+            Self::Borrowed(name) => *name,
+        }
+    }
+}
+
 impl std::ops::Add<usize> for ObjectOffset {
     type Output = Self;
 
@@ -936,7 +1016,7 @@ fn last_segment_no_generics(name: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn find_closest_relative_call<'p>(
-    fun_name: &RawString,
+    fun_name: RawString,
     overloads: &[RawString<'p>],
 ) -> RawString<'p> {
     match overloads.len() {

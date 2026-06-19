@@ -26,9 +26,6 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub output_path: std::path::PathBuf,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub engine_path: String,
-
     /// Pad each empty object's `.rdata` with 4 bytes. objdiff treats two
     /// allocations as matching when their name OR their offset into the reloc
     /// table is equal, so distinct relocations can match purely on a shared
@@ -69,7 +66,6 @@ fn main() -> anyhow::Result<()> {
         pdb_path,
         exe_path,
         output_path,
-        engine_path,
         pad_empty_rdata,
         write_symbol_map,
         read_symbol_map,
@@ -83,15 +79,9 @@ fn main() -> anyhow::Result<()> {
     let pdb = std::io::Cursor::new(pdb);
     let pdb = pdb2::PDB::open(pdb)?;
 
-    let mut engine_path = engine_path.to_lowercase().replace('/', "\\");
-    if !engine_path.ends_with('\\') {
-        engine_path.push('\\');
-    }
-
     process_executable(
         exe,
         pdb,
-        engine_path.as_bytes(),
         pad_empty_rdata,
         output_path.as_path(),
         write_symbol_map.as_deref(),
@@ -104,7 +94,6 @@ fn main() -> anyhow::Result<()> {
 fn process_executable<S: pdb2::Source<'static> + 'static>(
     exe: &'static object::read::pe::PeFile32<'static>,
     mut pdb: pdb2::PDB<'static, S>,
-    engine_path: &[u8],
     pad_empty_rdata: bool,
     output_path: &std::path::Path,
     write_symbol_map: Option<&std::path::Path>,
@@ -136,7 +125,6 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &coff_data,
         relocs_rva,
-        engine_path,
         pad_empty_rdata,
         &matcher,
     )?;

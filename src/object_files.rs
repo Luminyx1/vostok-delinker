@@ -1,10 +1,10 @@
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
 use crate::symbol_matcher::{canonical_name, SymbolMatcher};
-use crate::utils::{contains, leak, ToU64, ToUsize};
+use crate::utils::{leak, ToU64, ToUsize};
 use crate::Env;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
@@ -44,19 +44,89 @@ impl ObjectFiles<'_> {
         coff_data: &[u8],
         mut relocs_rva: BTreeMap<usize, RelocKind<'s>>,
 
-        engine_path: &[u8],
         pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
     {
+        let mut lib_sources: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut module_libs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        {
+            let mut modules = env.dbi.modules()?;
+            while let Some(module) = modules.next()? {
+                let lib = lib_name_from_bytes(module.object_file_name().as_bytes());
+
+                let Ok(Some(module_info)) = pdb.module_info(&module) else {
+                    module_libs.push((lib, Vec::new()));
+                    continue;
+                };
+                let module_info = leak(module_info);
+                let program = module_info.line_program()?;
+                let mut iter = module_info.symbols()?;
+
+                while let Some(symbol) = iter.next()? {
+                    let (_, fun_offset) = match symbol.parse() {
+                        Ok(pdb2::SymbolData::Procedure(p)) => (p.name, p.offset),
+                        Ok(pdb2::SymbolData::Thunk(t)) => (t.name, t.offset),
+                        _ => continue,
+                    };
+                    if let Some(src) = get_source_file(&program, env.string_table, fun_offset)?
+                    {
+                        lib_sources.entry(lib.clone()).or_default().insert(normalise(src));
+                    }
+                }
+
+                module_libs.push((lib, Vec::new()));
+            }
+        }
+
+        let lib_roots: HashMap<Vec<u8>, Vec<u8>> = lib_sources
+            .iter()
+            .map(|(lib, sources)| {
+                let root = common_project_root(sources);
+                (lib.clone(), root)
+            })
+            .collect();
+
+        let collapse_depths: HashMap<Vec<u8>, usize> = lib_sources
+            .iter()
+            .map(|(lib, sources)| {
+                let root = lib_roots.get(lib).unwrap();
+                let relative_paths: BTreeSet<Vec<u8>> = sources
+                    .iter()
+                    .filter(|src| is_translation_unit(src))
+                    .filter(|src| !is_likely_primary_source(src, lib))
+                    .filter_map(|src| {
+                        let r = src.strip_prefix(root.as_slice())?;
+                        if r.is_empty() { None } else { Some(r.to_vec()) }
+                    })
+                    .collect();
+                (lib.clone(), path_chain_depth(lib, &relative_paths))
+            })
+            .collect();
+
+        for (lib, root) in &mut module_libs {
+            if let Some(r) = lib_roots.get(lib) {
+                *root = r.clone();
+            }
+        }
+
         let mut this = Self {
             objects: HashMap::new(),
         };
 
+        let mut module_idx = 0usize;
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
+            let (lib_name, project_root) = &module_libs[module_idx];
+            module_idx += 1;
+
+            if is_system_lib(lib_name) {
+                continue;
+            }
+
             let Some(module_info) = pdb.module_info(&module)? else {
                 continue;
             };
@@ -79,15 +149,62 @@ impl ObjectFiles<'_> {
                     _ => continue,
                 };
 
-                let Some(filename) = get_function_location(
+                let source_file = get_source_file(
                     &program,
                     env.string_table,
-                    fun_name,
                     fun_offset,
-                    engine_path,
-                )?
-                else {
-                    continue;
+                )?;
+
+                let object_key: &'static [u8] = match source_file {
+                    Some(src) => {
+                        let normalised = normalise(src);
+                        if !is_translation_unit(&normalised) {
+                            continue;
+                        }
+                        let relative: Vec<u8> = {
+                            let r = normalised
+                                .as_slice()
+                                .strip_prefix(project_root.as_slice())
+                                .unwrap_or(normalised.as_slice());
+                            if r.is_empty() {
+                                normalised
+                                    .rsplit(|&b| b == b'\\')
+                                    .next()
+                                    .unwrap_or(&normalised)
+                                    .to_vec()
+                            } else if let Some(&depth) = collapse_depths.get(lib_name) {
+                                if depth > 0 {
+                                    let components: Vec<&[u8]> = r.split(|&b| b == b'\\').collect();
+                                    if depth < components.len() {
+                                        components[depth..].join(&b'\\')
+                                    } else {
+                                        r.to_vec()
+                                    }
+                                } else {
+                                    r.to_vec()
+                                }
+                            } else {
+                                r.to_vec()
+                            }
+                        };
+                        let is_primary = is_translation_unit_match(&normalised, lib_name);
+                        let mut key = if is_primary {
+                            let name = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
+                            Vec::with_capacity(name.len())
+                        } else {
+                            Vec::with_capacity(lib_name.len() + 1 + relative.len())
+                        };
+                        if is_primary {
+                            let name = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
+                            key.extend_from_slice(name);
+                        } else {
+                            key.extend_from_slice(lib_name);
+                            key.push(b'\\');
+                            key.extend_from_slice(&relative);
+                        }
+                        key.leak()
+                    }
+                    None => continue,
                 };
 
                 let fun_rva = env.text.rva + fun_offset.offset.to_usize();
@@ -102,7 +219,7 @@ impl ObjectFiles<'_> {
 
                 let object_file = this
                     .objects
-                    .entry(filename)
+                    .entry(object_key)
                     .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
 
                 let fun_name = match symbols.functions.get(&fun_rva) {
@@ -193,64 +310,20 @@ impl ObjectFile {
     }
 }
 
-/// Returns object file location for a given function.
-//
-// @NOTE: This function will leak memory in some cases.
-// This simplifies string passing, and shouldn't matter for this script.
-fn get_function_location(
+/// Returns the raw source file path for the line containing a given function.
+fn get_source_file(
     program: &pdb2::LineProgram<'static>,
     string_table: &'static pdb2::StringTable<'static>,
-
-    fun_name: RawString<'static>,
     fun_offset: pdb2::PdbInternalSectionOffset,
-
-    engine_path: &[u8],
 ) -> anyhow::Result<Option<&'static [u8]>> {
-    let mut filename = None;
-
     let mut lines = program.lines_for_symbol(fun_offset);
     // Extracting only a single line should be enough to find a source file.
     if let Some(line_info) = lines.next()? {
         let file_info = program.get_file_info(line_info.file_index)?;
-        filename = Some(string_table.get(file_info.name)?);
+        let filename = string_table.get(file_info.name)?;
+        return Ok(Some(filename.as_bytes()));
     }
-
-    let location: &'static [u8] = match filename {
-        Some(filename) => match filename.as_bytes().strip_prefix(engine_path) {
-            Some(filename) => filename,
-            None => return Ok(None),
-        },
-        None => match fun_name.as_bytes() {
-            name if !contains(name, b"::") && !name.contains(&b' ') => b"_msvc_internal\\c_lang",
-            name => {
-                let name = name.strip_prefix(b"[thunk]:").unwrap_or(name);
-                let name = name.strip_prefix(b"`").unwrap_or(name);
-
-                let is_bullet = |name: &[u8]| {
-                    name.starts_with(b"bt")
-                        && name.len() > b"bt".len()
-                        && name[b"bt".len()].is_ascii_uppercase()
-                };
-
-                match name {
-                    name if is_bullet(name) => b"_msvc_internal\\bullet",
-                    name => match name
-                        .windows("::".len())
-                        .position(|c| c == b"::" || c.starts_with(b"<"))
-                    {
-                        None => b"_msvc_internal\\cpp_lang",
-                        Some(pos) => {
-                            let mut path = b"_msvc_internal\\".to_vec();
-                            path.extend_from_slice(&name[0..pos]);
-                            path.leak()
-                        }
-                    },
-                }
-            }
-        },
-    };
-
-    Ok(Some(location))
+    Ok(None)
 }
 
 /// Resolve external relative jumps in the function as relocations.
@@ -589,6 +662,187 @@ fn append_with_padding(
     }
 
     offset
+}
+
+fn is_system_lib(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"kernel32"
+            | b"libcmtd"
+            | b"libcpmtd"
+            | b"shell32"
+            | b"user32"
+            | b"gdi32"
+            | b"advapi32"
+            | b"msvcrt"
+            | b"msvcrtd"
+            | b"oldnames"
+            | b"libcmt"
+            | b"libcpmt"
+            | b"msvcprt"
+            | b"msvcprtd"
+    )
+}
+
+fn is_translation_unit(path: &[u8]) -> bool {
+    path.ends_with(b".c")
+        || path.ends_with(b".cpp")
+        || path.ends_with(b".cc")
+        || path.ends_with(b".cxx")
+        || path.ends_with(b".asm")
+        || path.ends_with(b".s")
+}
+
+/// Returns true if the source path's filename stem (without extension) matches
+/// the lib_name, indicating a primary translation unit that should be placed
+/// directly in the output directory rather than nested under source tree paths.
+fn is_translation_unit_match(path: &[u8], lib_name: &[u8]) -> bool {
+    let stem = path
+        .rsplit(|&b| b == b'\\')
+        .next()
+        .and_then(|f| {
+            let dot = f.iter().rposition(|&b| b == b'.')?;
+            Some(&f[..dot])
+        })
+        .unwrap_or(path);
+    if stem.eq_ignore_ascii_case(lib_name) {
+        return true;
+    }
+    // Debug libraries in MSVC get a 'd' suffix (e.g., gx2windowsd). Primary
+    // translation units are named without the 'd' (e.g., gx2windows.cpp).
+    if let Some(stripped) = lib_name.strip_suffix(b"d").or_else(|| lib_name.strip_suffix(b"D")) {
+        stem.eq_ignore_ascii_case(stripped)
+    } else {
+        false
+    }
+}
+
+/// Same logic as `is_translation_unit_match` — used to exclude primary-TU
+/// paths from per-library chain‑depth computation so they don't pollute it.
+fn is_likely_primary_source(path: &[u8], lib_name: &[u8]) -> bool {
+    is_translation_unit_match(path, lib_name)
+}
+
+/// Count leading path-component levels that form a "chain" (each level has
+/// exactly one unique subdirectory across all paths and no paths end there),
+/// or 1 if the first component duplicates the lib name.
+///
+/// A chain of >= 3 gets collapsed to the branch point; a duplicate gets
+/// collapsed to eliminate the repeated directory.
+fn path_chain_depth(lib_name: &[u8], relative_paths: &BTreeSet<Vec<u8>>) -> usize {
+    if relative_paths.is_empty() {
+        return 0;
+    }
+
+    let components: Vec<Vec<&[u8]>> = relative_paths
+        .iter()
+        .map(|p| p.split(|&b| b == b'\\').collect())
+        .collect();
+
+    let min_depth = components.iter().map(|c| c.len()).min().unwrap_or(0);
+
+    let mut chain_depth = 0usize;
+    for depth in 0..min_depth {
+        let first = components[0][depth];
+        let all_same = components.iter().all(|c| c[depth] == first);
+        let all_continue = components.iter().all(|c| c.len() > depth + 1);
+        if !all_same || !all_continue {
+            break;
+        }
+        chain_depth += 1;
+    }
+
+    // Duplicate: relative starts with the lib name itself.
+    let has_duplicate = chain_depth >= 1 && components[0][0] == lib_name;
+
+    if chain_depth >= 3 {
+        chain_depth
+    } else if has_duplicate {
+        1
+    } else {
+        0
+    }
+}
+
+fn normalise(path: &[u8]) -> Vec<u8> {
+    path.iter()
+        .map(|&b| if b == b'/' { b'\\' } else { b.to_ascii_lowercase() })
+        .collect()
+}
+
+fn lib_name_from_bytes(raw: &[u8]) -> Vec<u8> {
+    let raw = if raw.len() > 4
+        && (raw[raw.len() - 4..].eq_ignore_ascii_case(b".obj")
+            || raw[raw.len() - 4..].eq_ignore_ascii_case(b".lib"))
+    {
+        &raw[..raw.len() - 4]
+    } else {
+        raw
+    };
+    let stem = raw.rsplit(|&b| b == b'\\' || b == b'/').next().unwrap_or(raw);
+    stem.to_ascii_lowercase()
+}
+
+/// Find longest common directory prefix among a set of normalised paths.
+/// Excludes system/MSVC include paths from the common prefix calculation
+/// so they don't pollute the project root.
+fn common_project_root(paths: &BTreeSet<Vec<u8>>) -> Vec<u8> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    // Filter to only "project" paths (not system include paths)
+    let project_paths: Vec<&[u8]> = paths
+        .iter()
+        .map(|p| p.as_slice())
+        .filter(|p| {
+            !p.starts_with(b"c:\\program files")
+                && !p.starts_with(b"f:\\dd\\vctools")
+                && !p.starts_with(b"c:\\dd\\vctools")
+        })
+        .collect();
+
+    if project_paths.is_empty() {
+        // All are system paths; use the full set
+        let first: &[u8] = paths.iter().next().unwrap();
+        let mut prefix_end = first.len();
+        for p in paths.iter().skip(1) {
+            let max = prefix_end.min(p.len());
+            let mut split = 0usize;
+            for i in 0..max {
+                if first[i] != p[i] {
+                    break;
+                }
+                if first[i] == b'\\' {
+                    split = i + 1;
+                }
+            }
+            prefix_end = split;
+            if prefix_end == 0 {
+                break;
+            }
+        }
+        return first[..prefix_end].to_vec();
+    }
+
+    let first = project_paths[0];
+    let mut prefix_end = first.len();
+    for p in &project_paths[1..] {
+        let max = prefix_end.min(p.len());
+        let mut split = 0usize;
+        for i in 0..max {
+            if first[i] != p[i] {
+                break;
+            }
+            if first[i] == b'\\' {
+                split = i + 1;
+            }
+        }
+        prefix_end = split;
+        if prefix_end == 0 {
+            break;
+        }
+    }
+    first[..prefix_end].to_vec()
 }
 
 //

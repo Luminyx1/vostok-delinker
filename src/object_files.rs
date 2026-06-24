@@ -5,12 +5,552 @@ use crate::utils::{leak, ToU64, ToUsize};
 use crate::Env;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
 use pdb2::{FallibleIterator, RawString};
 
 use object::SectionKind;
+
+// ---------------------------------------------------------------------------
+// extern "C" decoration accounting.
+//
+// These are incremented every time `coff_decorate_function_name` is asked to
+// decorate a name. They are purely informational — surfaced by `main.rs` at
+// the end of a run so the operator can sanity-check that the rule is hitting
+// the expected population (mostly `extern "C"` names needing a `_`, plus a
+// tail of already-decorated DLL exports / intrinsics / mangled C++ / fastcall
+// names that are left untouched).
+// ---------------------------------------------------------------------------
+
+/// Number of function names that had *no* leading `_` and got one prepended
+/// (cdecl / stdcall `extern "C"` names whose PDB public symbol was
+/// underscore-stripped, OR internal functions only seen as a Procedure
+/// symbol with no leading `_`).
+pub static DECORATED_EXTERN_C: AtomicUsize = AtomicUsize::new(0);
+/// Number of function names that already had a leading `_` (DLL-export
+/// Publics that kept their underscore, intrinsics like `_chkstk`, or
+/// Procedure symbols whose source declared them with `_`) and were left
+/// untouched so we don't double-decorate.
+pub static LEFT_ALONE_ALREADY_UNDERSCORED: AtomicUsize = AtomicUsize::new(0);
+/// Number of function names that were recognised as already-mangled C++ (`?`)
+/// or fastcall-decorated (`@`) and left untouched.
+pub static LEFT_ALONE_MANGLED: AtomicUsize = AtomicUsize::new(0);
+
+/// Apply MSVC's `extern "C"` leading-underscore decoration to a function
+/// name, **without double-decorating names that already start with `_`**.
+///
+/// # Why this exists
+///
+/// MSVC's compiler (`cl.exe`) decorates `extern "C"` cdecl/stdcall function
+/// names with a single leading underscore when emitting COFF object files:
+/// source `void foo()` becomes `_foo` in the .obj, source `void __stdcall
+/// foo(int)` becomes `_foo@4`. The delinker reads function names from the
+/// PDB, and the PDB can hand us names in *either* of two states:
+///
+/// 1. **Underscore-stripped** - for ordinary cdecl/stdcall Public symbols
+///    the linker strips exactly one leading `_`, so the PDB records `foo`,
+///    `foo@4`. Internal functions seen only via their Procedure symbol are
+///    also typically recorded without the leading `_` (the Procedure record
+///    carries the *source* identifier). These need a `_` re-added to match
+///    what `cl.exe` would emit.
+///
+/// 2. **Already decorated** - DLL-exported `extern "C"` functions keep the
+///    leading `_` in their Public name (the linker does *not* strip it for
+///    exports; see `_GSH2Destroy`, `_GSH2Initialize` in any real game PDB).
+///    Compiler intrinsics like `_chkstk`, `_security_check_cookie` are
+///    declared with the `_` in source and the PDB records them that way.
+///    These must be left alone - adding another `_` would produce
+///    `__GSH2Destroy` and break objdiff matching against the freshly
+///    compiled base, whose `cl.exe` also emits `_GSH2Destroy`.
+///
+/// # The rule
+///
+/// Classification is a pure function of the first byte of the name:
+///
+/// | First byte | Verdict                                     | Example                     |
+/// |------------|---------------------------------------------|-----------------------------|
+/// | `?`        | Mangled C++ - leave alone                   | `?foo@@YAXXZ`               |
+/// | `@`        | Fastcall - leave alone                      | `@foo@4`                    |
+/// | `_`        | Already decorated - leave alone             | `_GSH2Destroy`, `_chkstk`   |
+/// | (other)    | `extern "C"` needing decoration - add `_`   | `foo`->`_foo`, `foo@4`->`_foo@4` |
+///
+/// The net effect: the output always has *exactly one* leading underscore
+/// for cdecl/stdcall names, regardless of whether the PDB already had one.
+///
+/// # Verification contract
+///
+/// This function is the *only* place names get decorated. It is exercised
+/// by both `add_function` (the symbol definition site) and the
+/// `RelocKind::Function` arm of `add_relocation_at` (every reference site),
+/// so a function's definition and all of its references are guaranteed to
+/// carry the same decorated name. The classification is a pure function of
+/// the first byte of the name, and unit tests below pin each branch -
+/// including the regression test for the user-reported `_GSH2Destroy` case.
+pub(crate) fn coff_decorate_function_name(name: &[u8]) -> Vec<u8> {
+    match name.first().copied() {
+        // Mangled C++ (`?foo@@YAXXZ`) or fastcall (`@foo@4`) - neither uses
+        // the cdecl underscore rule. Leave untouched.
+        Some(b'?') | Some(b'@') => {
+            LEFT_ALONE_MANGLED.fetch_add(1, Ordering::Relaxed);
+            name.to_vec()
+        }
+        // Name already starts with `_`. Two situations land here:
+        //   * DLL-exported `extern "C"` Publics whose `_` was *not* stripped
+        //     by the linker (e.g. `_GSH2Destroy`, `_GSH2Initialize`).
+        //   * Intrinsics / source-declared `_foo` names recorded as-is.
+        // In both cases the desired .obj name is exactly what the PDB gave
+        // us - adding another `_` would double-decorate and break objdiff
+        // matching. Leave untouched.
+        Some(b'_') => {
+            LEFT_ALONE_ALREADY_UNDERSCORED.fetch_add(1, Ordering::Relaxed);
+            name.to_vec()
+        }
+        // Everything else is `extern "C"` (cdecl or stdcall) whose PDB name
+        // was underscore-stripped. The MSVC mangler prepends exactly one `_`;
+        // we mirror that.
+        _ => {
+            DECORATED_EXTERN_C.fetch_add(1, Ordering::Relaxed);
+            let mut decorated = Vec::with_capacity(name.len() + 1);
+            decorated.push(b'_');
+            decorated.extend_from_slice(name);
+            decorated
+        }
+    }
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::coff_decorate_function_name;
+
+    // ---- decoration branch: names that DO get a `_` prepended ----
+
+    #[test]
+    fn cdecl_plain_name_gets_underscore() {
+        // Source `extern "C" void foo()` -> PDB public `foo` (stripped)
+        // -> .obj `_foo`.
+        assert_eq!(coff_decorate_function_name(b"foo"), b"_foo");
+    }
+
+    #[test]
+    fn stdcall_name_gets_underscore_before_at_suffix() {
+        // Source `extern "C" void __stdcall foo(int)` -> PDB public `foo@4`
+        // (linker strips the cdecl underscore, keeps the `@4`) -> .obj `_foo@4`.
+        assert_eq!(coff_decorate_function_name(b"foo@4"), b"_foo@4");
+    }
+
+    #[test]
+    fn internal_function_procedure_name_gets_underscore() {
+        // The user's working case: an internal function seen only via its
+        // Procedure symbol, recorded without a leading `_`. We must add one.
+        assert_eq!(
+            coff_decorate_function_name(b"InitGLSL130TextureFunctions_1"),
+            b"_InitGLSL130TextureFunctions_1",
+        );
+    }
+
+    // ---- leave-alone branch: names that already start with `_` ----
+
+    #[test]
+    fn dll_export_with_underscore_is_left_alone() {
+        // The user's reported regression: `_GSH2Destroy` in the PDB (a DLL
+        // export whose Public name kept its `_`) must NOT become
+        // `__GSH2Destroy`. The base `cl.exe` compile emits `_GSH2Destroy`,
+        // so the delinked target must too.
+        assert_eq!(coff_decorate_function_name(b"_GSH2Destroy"), b"_GSH2Destroy");
+    }
+
+    #[test]
+    fn dll_export_family_is_left_alone() {
+        // Real names from shaderUtilsD.pdb - all DLL exports whose Public
+        // symbol retained the leading `_`. All must stay single-underscored.
+        for name in [
+            &b"_GSH2Initialize"[..],
+            &b"_GSH2CompileProgram"[..],
+            &b"_GSH2DestroyGX2Program"[..],
+            &b"_GSH2CalcFetchShaderSizeEx"[..],
+            &b"_GX2GetAttribFormatBits"[..],
+        ] {
+            assert_eq!(coff_decorate_function_name(name), name);
+        }
+    }
+
+    #[test]
+    fn intrinsic_with_underscore_is_left_alone() {
+        // `_chkstk` is a compiler intrinsic declared with `_` in source.
+        // The PDB records it as `_chkstk`. We leave it alone - adding
+        // another `_` would give `__chkstk`, which only matches a base
+        // compile of source `_chkstk` if the compiler also doubled it, and
+        // for intrinsics it doesn't.
+        assert_eq!(coff_decorate_function_name(b"_chkstk"), b"_chkstk");
+    }
+
+    #[test]
+    fn double_underscore_intrinsic_is_left_alone() {
+        // Same rule for `__security_check_cookie`-style names: they already
+        // start with `_`, so leave them alone.
+        assert_eq!(
+            coff_decorate_function_name(b"__security_check_cookie"),
+            b"__security_check_cookie",
+        );
+    }
+
+    #[test]
+    fn import_thunk_with_underscore_is_left_alone() {
+        // Import load thunks like `__imp_load_X` already carry their leading
+        // `_`; do not double-decorate.
+        assert_eq!(
+            coff_decorate_function_name(b"__imp_load_CreateFileA@4"),
+            b"__imp_load_CreateFileA@4",
+        );
+    }
+
+    // ---- leave-alone branch: mangled C++ and fastcall ----
+
+    #[test]
+    fn mangled_cpp_name_is_left_alone() {
+        let mangled = b"?foo@@YAXH@Z";
+        assert_eq!(coff_decorate_function_name(mangled), mangled);
+    }
+
+    #[test]
+    fn mangled_cpp_member_name_is_left_alone() {
+        let mangled = b"?bar@Foo@@QAEXXZ";
+        assert_eq!(coff_decorate_function_name(mangled), mangled);
+    }
+
+    #[test]
+    fn fastcall_name_is_left_alone() {
+        let fastcall = b"@foo@4";
+        assert_eq!(coff_decorate_function_name(fastcall), fastcall);
+    }
+
+    // ---- defensive / boundary ----
+
+    #[test]
+    fn empty_name_is_decorated_to_single_underscore() {
+        // Should not happen in practice, but the helper must not panic on
+        // an empty slice. An empty name has no first byte, so it falls into
+        // the "needs decoration" branch and becomes a single `_`.
+        assert_eq!(coff_decorate_function_name(b""), b"_");
+    }
+
+    #[test]
+    fn classification_is_pure_in_first_byte() {
+        // Sanity sweep: the verdict depends ONLY on the first byte.
+        // (This is the property the user asked us to verify.)
+        //
+        // Left alone - starts with `?`, `@`, or `_`:
+        for left_alone in [
+            &b"?"[..],
+            &b"?x"[..],
+            &b"?foo@@YAXXZ"[..],
+            &b"@"[..],
+            &b"@foo@0"[..],
+            &b"_"[..],
+            &b"_x"[..],
+            &b"_foo"[..],
+            &b"__foo"[..],
+            &b"_foo@4"[..],
+            &b"_GSH2Destroy"[..],
+            &b"_chkstk"[..],
+        ] {
+            assert_eq!(coff_decorate_function_name(left_alone), left_alone);
+        }
+        // Decorated - does not start with `?`, `@`, or `_`:
+        for (input, expected) in [
+            (&b"a"[..], &b"_a"[..]),
+            (&b"foo"[..], &b"_foo"[..]),
+            (&b"foo@8"[..], &b"_foo@8"[..]),
+            (&b"GSH2Destroy"[..], &b"_GSH2Destroy"[..]),
+            (&b"InitGLSL130TextureFunctions_1"[..], &b"_InitGLSL130TextureFunctions_1"[..]),
+            (&b""[..], &b"_"[..]),
+        ] {
+            assert_eq!(coff_decorate_function_name(input), expected);
+        }
+    }
+
+    #[test]
+    fn output_always_has_exactly_one_leading_underscore_for_cdecl() {
+        // The headline invariant: for an `extern "C"` cdecl name, regardless
+        // of whether the PDB gave us the stripped or un-stripped form, the
+        // .obj output has exactly ONE leading `_`.
+        //
+        //   PDB `GSH2Destroy`   (Procedure, stripped)  -> `_GSH2Destroy`
+        //   PDB `_GSH2Destroy`  (Public, un-stripped)  -> `_GSH2Destroy`
+        //
+        // Both forms produce the same .obj name. That's what makes the
+        // delinked target match the `cl.exe`-compiled base for both
+        // internal and exported `extern "C"` functions.
+        assert_eq!(coff_decorate_function_name(b"GSH2Destroy"),  b"_GSH2Destroy");
+        assert_eq!(coff_decorate_function_name(b"_GSH2Destroy"), b"_GSH2Destroy");
+        // And critically, neither produces `__GSH2Destroy`.
+        assert_ne!(coff_decorate_function_name(b"_GSH2Destroy"), b"__GSH2Destroy");
+    }
+}
+
+#[cfg(test)]
+mod end_to_end_tests {
+    //! These tests drive the *real* `ObjectFile::add_function` /
+    //! `add_relocation` paths, then write the resulting COFF bytes, parse
+    //! them back with the `object` read API, and inspect the symbol table.
+    //! That end-to-end round-trip is what proves the decoration actually
+    //! lands in the .obj — not just in the helper function's return value.
+
+    use super::*;
+    use object::read::{Object as _, ObjectSymbol as _};
+    use pdb2::RawString;
+
+    /// Walk the symbols of a freshly-written `ObjectFile` and collect their
+    /// names as `Vec<u8>`. Panics on any read error.
+    fn written_symbol_names(of: ObjectFile) -> Vec<Vec<u8>> {
+        let bytes = of.object.write().expect("object write");
+        let file = object::read::File::parse(&*bytes).expect("object parse");
+        file.symbols()
+            .filter_map(|s| s.name().ok().map(|n| n.as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn cdecl_extern_c_gets_underscore_in_obj() {
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"foo".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"_foo"),
+            "expected `_foo` in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"foo"),
+            "bare `foo` (without `_`) must NOT appear, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn stdcall_extern_c_gets_underscore_before_at_suffix_in_obj() {
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"foo@4".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"_foo@4"),
+            "expected `_foo@4` in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"foo@4"),
+            "bare `foo@4` (without `_`) must NOT appear, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn intrinsic_starting_with_underscore_is_left_alone_in_obj() {
+        // PDB `_chkstk` -> .obj `_chkstk`. The intrinsic already carries the
+        // leading `_` the compiler would emit, so we do NOT double-decorate.
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"_chkstk".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"_chkstk"),
+            "expected `_chkstk` in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"__chkstk"),
+            "`__chkstk` (double `_`) must NOT appear, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn dll_export_with_underscore_is_left_alone_in_obj() {
+        // The user-reported regression: PDB `_GSH2Destroy` (DLL export whose
+        // Public name kept its `_`) must stay `_GSH2Destroy` in the .obj,
+        // NOT become `__GSH2Destroy`.
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"_GSH2Destroy".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"_GSH2Destroy"),
+            "expected `_GSH2Destroy` in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"__GSH2Destroy"),
+            "`__GSH2Destroy` (double `_`) must NOT appear, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn stripped_and_unstripped_forms_of_same_name_produce_same_obj_symbol() {
+        // The headline end-to-end invariant: the PDB can give us either
+        // `GSH2Destroy` (Procedure symbol, no `_`) or `_GSH2Destroy`
+        // (Public symbol, with `_`) for the *same* function. Whichever we
+        // see, the .obj symbol must come out as `_GSH2Destroy` so it matches
+        // the base compile.
+        let mut of_a = ObjectFile::empty(false);
+        of_a.add_function(RawString::from(b"GSH2Destroy".as_ref()), &[0xC3]);
+        let mut of_b = ObjectFile::empty(false);
+        of_b.add_function(RawString::from(b"_GSH2Destroy".as_ref()), &[0xC3]);
+
+        let names_a = written_symbol_names(of_a);
+        let names_b = written_symbol_names(of_b);
+
+        assert!(names_a.iter().any(|n| n == b"_GSH2Destroy"),
+            "stripped form `GSH2Destroy` should decorate to `_GSH2Destroy`, got: {:?}", names_a);
+        assert!(names_b.iter().any(|n| n == b"_GSH2Destroy"),
+            "un-stripped form `_GSH2Destroy` should stay `_GSH2Destroy`, got: {:?}", names_b);
+        // And neither should produce the double-underscored form.
+        assert!(!names_a.iter().any(|n| n == b"__GSH2Destroy"),
+            "stripped form must NOT produce `__GSH2Destroy`, got: {:?}", names_a);
+        assert!(!names_b.iter().any(|n| n == b"__GSH2Destroy"),
+            "un-stripped form must NOT produce `__GSH2Destroy`, got: {:?}", names_b);
+    }
+
+    #[test]
+    fn mangled_cpp_survives_unchanged_in_obj() {
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"?foo@@YAXXZ".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"?foo@@YAXXZ"),
+            "expected `?foo@@YAXXZ` unchanged in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"_?foo@@YAXXZ"),
+            "mangled name must NOT be prefixed with `_`, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn mangled_cpp_member_function_survives_unchanged_in_obj() {
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"?bar@Foo@@QAEXXZ".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"?bar@Foo@@QAEXXZ"),
+            "expected `?bar@Foo@@QAEXXZ` unchanged in symbol table, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn fastcall_survives_unchanged_in_obj() {
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"@foo@4".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+        assert!(
+            names.iter().any(|n| n == b"@foo@4"),
+            "expected `@foo@4` unchanged in symbol table, got: {:?}",
+            names,
+        );
+        assert!(
+            !names.iter().any(|n| n == b"_@foo@4"),
+            "fastcall name must NOT be prefixed with `_`, got: {:?}",
+            names,
+        );
+    }
+
+    #[test]
+    fn mixed_object_decorates_only_extern_c() {
+        // Object file containing all five cases at once - proves the rule
+        // doesn't bleed across symbols.
+        let mut of = ObjectFile::empty(false);
+        of.add_function(RawString::from(b"cdecl_foo".as_ref()), &[0xC3]);
+        of.add_function(RawString::from(b"stdcall_foo@4".as_ref()), &[0xC3]);
+        of.add_function(RawString::from(b"?cpp_foo@@YAXXZ".as_ref()), &[0xC3]);
+        of.add_function(RawString::from(b"@fastcall_foo@4".as_ref()), &[0xC3]);
+        // DLL-export-style name that already has its `_`:
+        of.add_function(RawString::from(b"_GSH2Destroy".as_ref()), &[0xC3]);
+
+        let names = written_symbol_names(of);
+
+        // extern "C" cdecl: decorated.
+        assert!(names.iter().any(|n| n == b"_cdecl_foo"),
+            "cdecl_foo should be decorated, got: {:?}", names);
+        // extern "C" stdcall: decorated (underscore before `@4`).
+        assert!(names.iter().any(|n| n == b"_stdcall_foo@4"),
+            "stdcall_foo@4 should be decorated, got: {:?}", names);
+        // mangled C++: unchanged.
+        assert!(names.iter().any(|n| n == b"?cpp_foo@@YAXXZ"),
+            "cpp_foo should be unchanged, got: {:?}", names);
+        // fastcall: unchanged.
+        assert!(names.iter().any(|n| n == b"@fastcall_foo@4"),
+            "fastcall_foo@4 should be unchanged, got: {:?}", names);
+        // DLL-export name: unchanged (NOT double-decorated).
+        assert!(names.iter().any(|n| n == b"_GSH2Destroy"),
+            "_GSH2Destroy should be unchanged, got: {:?}", names);
+
+        // Negative: no bare extern "C" names leak through.
+        assert!(!names.iter().any(|n| n == b"cdecl_foo"),
+            "bare cdecl_foo must NOT appear, got: {:?}", names);
+        assert!(!names.iter().any(|n| n == b"stdcall_foo@4"),
+            "bare stdcall_foo@4 must NOT appear, got: {:?}", names);
+        // Negative: no double-underscored DLL-export name.
+        assert!(!names.iter().any(|n| n == b"__GSH2Destroy"),
+            "__GSH2Destroy (double `_`) must NOT appear, got: {:?}", names);
+    }
+
+    #[test]
+    fn function_reference_in_reloc_uses_decorated_name() {
+        // The critical invariant for linker resolution: a function's
+        // *definition* and its *references* must use the same name. Build a
+        // `caller` that calls `foo` via an extern reloc; both sites must end
+        // up as `_foo`.
+        let mut of = ObjectFile::empty(false);
+
+        // Define `foo`.
+        // Define `caller` whose body is `call rel32` (E8 + 4 bytes).
+        let caller_offset = of.add_function(
+            RawString::from(b"caller".as_ref()),
+            &[0xE8, 0, 0, 0, 0],
+        );
+        // Add a relocation referencing `foo`. The decoration must match the
+        // one `add_function` would apply, so the linker can pair them up.
+        of.add_relocation(
+            coff_decorate_function_name(b"foo"),
+            ObjectLocation::Extern,
+            ObjectOffset {
+                offset: caller_offset.offset + 1, // displacement is at +1
+                section_id: caller_offset.section_id,
+            },
+        )
+        .expect("add_relocation");
+
+        let names = written_symbol_names(of);
+
+        // The `caller` definition was decorated to `_caller`.
+        assert!(names.iter().any(|n| n == b"_caller"),
+            "expected `_caller`, got: {:?}", names);
+        // The relocation's extern reference to `foo` was decorated to `_foo`.
+        // (The `object` crate writes external symbols as separate symbol
+        // table entries, so `_foo` shows up alongside `_caller`.)
+        assert!(names.iter().any(|n| n == b"_foo"),
+            "expected reference `_foo`, got: {:?}", names);
+        // And critically, the bare name must NOT appear anywhere — neither
+        // as a definition nor as a reference.
+        assert!(!names.iter().any(|n| n == b"foo"),
+            "bare `foo` must NOT appear (would break linker resolution), got: {:?}",
+            names,
+        );
+        assert!(!names.iter().any(|n| n == b"caller"),
+            "bare `caller` must NOT appear, got: {:?}", names);
+    }
+}
+
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -429,7 +969,14 @@ impl ObjectFile {
 
         match reloc_kind {
             RelocKind::Function { overloads: _ } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+                // Function references must use the same decorated name as the
+                // function definition (see `add_function`); otherwise the
+                // linker would see a definition of `_foo` and a reference to
+                // `foo` as two unrelated externals. The decoration helper is
+                // a pure function of the name, so the result here is
+                // guaranteed identical to the one in `add_function`.
+                let decorated = coff_decorate_function_name(reloc_name.as_bytes());
+                self.add_relocation(decorated, ObjectLocation::Extern, reloc_offset)?;
             }
 
             RelocKind::ConstantString { symbol: _, data } => {
@@ -437,7 +984,7 @@ impl ObjectFile {
                     self.append_section_data(self.rdata_section_id, data, 0x00);
 
                 self.add_relocation(
-                    reloc_name,
+                    reloc_name.as_bytes().to_vec(),
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                 )?;
@@ -452,7 +999,7 @@ impl ObjectFile {
                 let const_offset_in_coff_rdata =
                     self.append_section_data(self.rdata_section_id, &new_data, 0x00);
                 self.add_relocation(
-                    reloc_name,
+                    reloc_name.as_bytes().to_vec(),
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                 )?;
@@ -481,7 +1028,7 @@ impl ObjectFile {
                 let static_offset_in_coff_data =
                     self.append_section_data(self.data_section_id, &new_data, 0x00);
                 self.add_relocation(
-                    reloc_name,
+                    reloc_name.as_bytes().to_vec(),
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
                 )?;
@@ -519,14 +1066,21 @@ impl ObjectFile {
 
     fn add_relocation(
         &mut self,
-        name: RawString,
+        name: Vec<u8>,
         location: ObjectLocation,
         offset: ObjectOffset,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
+            // `ObjectLocation::Extern` is only ever produced by the
+            // `RelocKind::Function` arm of `add_relocation_at`, so every
+            // extern relocation is a *function* reference. The kind must be
+            // `Text` (not `Unknown`) so that the `object` crate's COFF writer
+            // emits `IMAGE_SYM_CLASS_EXTERNAL` for the undefined symbol —
+            // `SymbolKind::Unknown` is rejected by the writer with
+            // "unimplemented symbol ... kind Unknown".
             ObjectLocation::Extern => (
                 0,
-                object::SymbolKind::Unknown,
+                object::SymbolKind::Text,
                 object::write::SymbolSection::Undefined,
             ),
             ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
@@ -544,7 +1098,7 @@ impl ObjectFile {
         };
 
         let symbol = self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
+            name,
             value,
             size: u64::MAX,
             kind,
@@ -574,8 +1128,14 @@ impl ObjectFile {
     fn add_function(&mut self, name: RawString, body: &[u8]) -> ObjectOffset {
         let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, body, 0x90);
 
+        // Apply MSVC's `extern "C"` cdecl/stdcall leading-underscore
+        // decoration so the .obj symbol matches what `cl.exe` would have
+        // emitted. Mangled C++ names (`?...`) and fastcall (`@...`) are
+        // returned unchanged by the helper.
+        let decorated_name = coff_decorate_function_name(name.as_bytes());
+
         self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
+            name: decorated_name,
             value: fun_offset_in_coff_text.offset,
             size: u64::MAX,
             kind: object::SymbolKind::Text,

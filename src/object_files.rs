@@ -729,14 +729,18 @@ impl ObjectFiles<'_> {
                         };
                         let is_primary = is_translation_unit_match(&normalised, lib_name);
                         let mut key = if is_primary {
-                            let name = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
-                            Vec::with_capacity(name.len())
+                            let filename = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
+                            let ext_pos = filename.iter().rposition(|&b| b == b'.');
+                            let ext_len = ext_pos.map(|p| filename.len() - p).unwrap_or(0);
+                            Vec::with_capacity(lib_name.len() + ext_len)
                         } else {
                             Vec::with_capacity(lib_name.len() + 1 + relative.len())
                         };
                         if is_primary {
-                            let name = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
-                            key.extend_from_slice(name);
+                            let filename = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
+                            let ext = filename.iter().rposition(|&b| b == b'.').map(|p| &filename[p..]).unwrap_or(b"");
+                            key.extend_from_slice(lib_name);
+                            key.extend_from_slice(ext);
                         } else {
                             key.extend_from_slice(lib_name);
                             key.push(b'\\');
@@ -1225,8 +1229,9 @@ fn append_with_padding(
 }
 
 fn is_system_lib(name: &[u8]) -> bool {
+    let lower: Vec<u8> = name.iter().map(|&b| b.to_ascii_lowercase()).collect();
     matches!(
-        name,
+        lower.as_slice(),
         b"kernel32"
             | b"libcmtd"
             | b"libcpmtd"
@@ -1245,12 +1250,16 @@ fn is_system_lib(name: &[u8]) -> bool {
 }
 
 fn is_translation_unit(path: &[u8]) -> bool {
-    path.ends_with(b".c")
-        || path.ends_with(b".cpp")
-        || path.ends_with(b".cc")
-        || path.ends_with(b".cxx")
-        || path.ends_with(b".asm")
-        || path.ends_with(b".s")
+    let ends_with_ignore_case = |suffix: &[u8]| -> bool {
+        path.len() >= suffix.len()
+            && path[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    };
+    ends_with_ignore_case(b".c")
+        || ends_with_ignore_case(b".cpp")
+        || ends_with_ignore_case(b".cc")
+        || ends_with_ignore_case(b".cxx")
+        || ends_with_ignore_case(b".asm")
+        || ends_with_ignore_case(b".s")
 }
 
 /// Returns true if the source path's filename stem (without extension) matches
@@ -1326,7 +1335,7 @@ fn path_chain_depth(lib_name: &[u8], relative_paths: &BTreeSet<Vec<u8>>) -> usiz
 
 fn normalise(path: &[u8]) -> Vec<u8> {
     path.iter()
-        .map(|&b| if b == b'/' { b'\\' } else { b.to_ascii_lowercase() })
+        .map(|&b| if b == b'/' { b'\\' } else { b })
         .collect()
 }
 
@@ -1340,7 +1349,7 @@ fn lib_name_from_bytes(raw: &[u8]) -> Vec<u8> {
         raw
     };
     let stem = raw.rsplit(|&b| b == b'\\' || b == b'/').next().unwrap_or(raw);
-    stem.to_ascii_lowercase()
+    stem.to_vec()
 }
 
 /// Find longest common directory prefix among a set of normalised paths.
@@ -1355,9 +1364,10 @@ fn common_project_root(paths: &BTreeSet<Vec<u8>>) -> Vec<u8> {
         .iter()
         .map(|p| p.as_slice())
         .filter(|p| {
-            !p.starts_with(b"c:\\program files")
-                && !p.starts_with(b"f:\\dd\\vctools")
-                && !p.starts_with(b"c:\\dd\\vctools")
+            let lower: Vec<u8> = p.iter().map(|&b| b.to_ascii_lowercase()).collect();
+            !lower.starts_with(b"c:\\program files")
+                && !lower.starts_with(b"f:\\dd\\vctools")
+                && !lower.starts_with(b"c:\\dd\\vctools")
         })
         .collect();
 

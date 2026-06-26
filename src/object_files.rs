@@ -732,14 +732,28 @@ impl ObjectFiles<'_> {
                             let filename = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
                             let ext_pos = filename.iter().rposition(|&b| b == b'.');
                             let ext_len = ext_pos.map(|p| filename.len() - p).unwrap_or(0);
-                            Vec::with_capacity(lib_name.len() + ext_len)
+                            let stem = ext_pos.map(|p| &filename[..p]).unwrap_or(filename);
+                            let display_len = if stem.eq_ignore_ascii_case(lib_name) {
+                                lib_name.len()
+                            } else {
+                                lib_name.len().saturating_sub(1)
+                            };
+                            Vec::with_capacity(display_len + ext_len)
                         } else {
                             Vec::with_capacity(lib_name.len() + 1 + relative.len())
                         };
                         if is_primary {
                             let filename = normalised.rsplit(|&b| b == b'\\').next().unwrap_or(&normalised);
                             let ext = filename.iter().rposition(|&b| b == b'.').map(|p| &filename[p..]).unwrap_or(b"");
-                            key.extend_from_slice(lib_name);
+                            let stem = filename.iter().rposition(|&b| b == b'.').map(|p| &filename[..p]).unwrap_or(filename);
+                            let display_name = if stem.eq_ignore_ascii_case(lib_name) {
+                                lib_name
+                            } else {
+                                lib_name.strip_suffix(b"d")
+                                    .or_else(|| lib_name.strip_suffix(b"D"))
+                                    .unwrap_or(lib_name)
+                            };
+                            key.extend_from_slice(display_name);
                             key.extend_from_slice(ext);
                         } else {
                             key.extend_from_slice(lib_name);
